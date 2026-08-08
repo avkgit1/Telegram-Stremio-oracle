@@ -1,0 +1,25 @@
+services:
+  telegram-stremio:
+    build:
+      context: .
+
+    container_name: tg-stremio
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      API_ID: ${API_ID}
+      API_HASH: ${API_HASH}
+      BOT_TOKEN: ${BOT_TOKEN}
+      OWNER_ID: ${OWNER_ID}
+      DATABASE: ${DATABASE}
+      PORT: ${PORT}
+
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"

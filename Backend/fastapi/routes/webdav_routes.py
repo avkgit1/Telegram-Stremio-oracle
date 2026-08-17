@@ -14,6 +14,10 @@ Supports the same media as Stremio streams:
   - multi-quality (each quality is a separate file in the folder)
   - split parts (.001/.002) joined as one virtual file
   - split zip archives (via existing zip streamer)
+
+Compatibility notes (2026-08):
+  - Always returns absolute hrefs in PROPFIND (required by many Android / media apps)
+  - Avoids relative paths that cause clients to fall back to port 80 on HTTPS hosts
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timezone
 from typing import List
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urljoin
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -89,16 +93,26 @@ async def _require_webdav_auth(request: Request, token: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# PROPFIND helpers
+# PROPFIND helpers (absolute hrefs for maximum client compatibility)
 # ---------------------------------------------------------------------------
 
-def _href(token: str, path: str, is_dir: bool) -> str:
+def _href(request: Request, token: str, path: str, is_dir: bool) -> str:
+    """
+    Return an absolute href.
+    Many Android / media WebDAV clients break on relative paths and fall back
+    to port 80 even when the original URL was https://.
+    """
     path = normalize_path(path)
     segments = [quote(s, safe="") for s in path.strip("/").split("/") if s]
-    base = f"/webdav/{token}/" + "/".join(segments)
-    if is_dir and not base.endswith("/"):
-        base += "/"
-    return base
+    rel = f"/webdav/{token}/" + "/".join(segments)
+    if is_dir and not rel.endswith("/"):
+        rel += "/"
+
+    # Prefer configured public BASE_URL, otherwise use the request itself
+    base = (getattr(Telegram, "BASE_URL", None) or "").rstrip("/")
+    if not base:
+        base = str(request.base_url).rstrip("/")
+    return urljoin(base + "/", rel.lstrip("/"))
 
 
 def _http_date(ts: float) -> str:
@@ -109,10 +123,10 @@ def _iso_date(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _prop_response(token: str, node: VNode) -> Element:
+def _prop_response(request: Request, token: str, node: VNode) -> Element:
     resp = Element(f"{{{DAV_NS}}}response")
     href = SubElement(resp, f"{{{DAV_NS}}}href")
-    href.text = _href(token, node.path, node.is_dir)
+    href.text = _href(request, token, node.path, node.is_dir)
 
     propstat = SubElement(resp, f"{{{DAV_NS}}}propstat")
     prop = SubElement(propstat, f"{{{DAV_NS}}}prop")
@@ -137,10 +151,10 @@ def _prop_response(token: str, node: VNode) -> Element:
     return resp
 
 
-def _multistatus_xml(token: str, nodes: List[VNode]) -> bytes:
+def _multistatus_xml(request: Request, token: str, nodes: List[VNode]) -> bytes:
     root = Element(f"{{{DAV_NS}}}multistatus")
     for node in nodes:
-        root.append(_prop_response(token, node))
+        root.append(_prop_response(request, token, node))
     return tostring(root, encoding="utf-8", xml_declaration=True)
 
 
@@ -251,7 +265,7 @@ async def webdav_propfind(request: Request, token: str, path: str = ""):
         nodes.extend(await fs.list_dir(vpath))
 
     return Response(
-        content=_multistatus_xml(token, nodes),
+        content=_multistatus_xml(request, token, nodes),
         status_code=207,
         media_type="application/xml; charset=utf-8",
         headers={"DAV": "1, 2"},
@@ -274,9 +288,9 @@ async def webdav_get(request: Request, token: str, path: str = ""):
         rows = []
         parent = normalize_path("/".join(vpath.rstrip("/").split("/")[:-1]) or "/")
         if vpath not in ("", "/"):
-            rows.append(f'<li><a href="{_href(token, parent, True)}">../</a></li>')
+            rows.append(f'<li><a href="{_href(request, token, parent, True)}">../</a></li>')
         for c in sorted(children, key=lambda n: (not n.is_dir, n.name.lower())):
-            href = _href(token, c.path, c.is_dir)
+            href = _href(request, token, c.path, c.is_dir)
             label = c.name + ("/" if c.is_dir else "")
             size = "" if c.is_dir else f" ({c.size} bytes)"
             rows.append(f'<li><a href="{href}">{label}</a>{size}</li>')

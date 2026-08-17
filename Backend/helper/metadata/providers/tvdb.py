@@ -233,7 +233,10 @@ async def series_extended(tvdb_id: int) -> Optional[dict]:
     cache_key = f"tvdb_series::{tvdb_id}"
 
     async def _produce():
-        data = await _get(f"/series/{tvdb_id}/extended")
+        # meta=translations is required or TVDB omits nameTranslations /
+        # overviewTranslations entirely, leaving name/overview in the
+        # record's original language.
+        data = await _get(f"/series/{tvdb_id}/extended", {"meta": "translations"})
         return (data or {}).get("data")
 
     return await cached_call(TVDB_CACHE, cache_key, "tvdb_series", _produce)
@@ -243,7 +246,7 @@ async def movie_extended(tvdb_id: int) -> Optional[dict]:
     cache_key = f"tvdb_movie::{tvdb_id}"
 
     async def _produce():
-        data = await _get(f"/movies/{tvdb_id}/extended")
+        data = await _get(f"/movies/{tvdb_id}/extended", {"meta": "translations"})
         return (data or {}).get("data")
 
     return await cached_call(TVDB_CACHE, cache_key, "tvdb_movie", _produce)
@@ -305,6 +308,22 @@ async def _iter_series_episodes(tvdb_id: int, order: str = "default") -> list:
     return all_eps
 
 
+async def episode_translation(episode_id: int, lang: str = "eng") -> Optional[dict]:
+    """Fetch the English (or given) translation for a single episode's
+    name/overview. Episode records from the /episodes/default listing don't
+    carry translations inline (unlike series/movies with meta=translations),
+    so this needs its own call — only done for the one episode being shown."""
+    if not episode_id:
+        return None
+    cache_key = f"tvdb_ep_tr::{episode_id}::{lang}"
+
+    async def _produce():
+        data = await _get(f"/episodes/{episode_id}/translations/{lang}")
+        return (data or {}).get("data")
+
+    return await cached_call(TVDB_CACHE, cache_key, "tvdb_ep_tr", _produce)
+
+
 async def episode_by_absolute(tvdb_id: int, absolute: int) -> Optional[dict]:
     """Resolve an absolute episode number to a TVDB episode record (with S/E).
 
@@ -364,6 +383,21 @@ def _remote_ids(doc: dict) -> tuple:
     return imdb_id, tmdb_id
 
 
+def _english_translation(doc: dict) -> tuple[Optional[str], Optional[str]]:
+    """Return (english_name, english_overview) from a TVDB extended record's
+    translations block, or (None, None) if not present / not fetched."""
+    tr = doc.get("translations") or {}
+    eng_name = None
+    for item in tr.get("nameTranslations") or []:
+        if isinstance(item, dict) and (item.get("language") or "").lower() in ("eng", "en"):
+            eng_name = item.get("name") or eng_name
+    eng_overview = None
+    for item in tr.get("overviewTranslations") or []:
+        if isinstance(item, dict) and (item.get("language") or "").lower() in ("eng", "en"):
+            eng_overview = item.get("overview") or eng_overview
+    return eng_name, eng_overview
+
+
 def _genres(doc: dict) -> list:
     out = []
     for g in doc.get("genres") or []:
@@ -402,24 +436,19 @@ def build_series_payload(
     ep_overview = (ep or {}).get("overview") or ""
     ep_aired = (ep or {}).get("aired") or (ep or {}).get("firstAired") or ""
     title = series.get("name") or series.get("slug") or ""
-    # Prefer English translation when available
-    eng = None
-    try:
-        for tr in (series.get("translations") or {}).get("nameTranslations") or []:
-            if isinstance(tr, dict) and (tr.get("language") or "").lower() in ("eng", "en"):
-                eng = tr.get("name") or eng
-    except Exception:
-        pass
+    # Prefer English translation when available (requires meta=translations
+    # on the /extended fetch — see series_extended()).
+    eng_name, eng_overview = _english_translation(series)
     payload = {
         "tmdb_id": tmdb_id,
         "imdb_id": imdb_id,
         "title": title,
-        "title_english": eng or title,
+        "title_english": eng_name or title,
         "original_title": series.get("name") or "",
         "year": year,
         "year_end": year_end,
         "rate": rate,
-        "description": series.get("overview") or "",
+        "description": eng_overview or series.get("overview") or "",
         "poster": poster,
         "backdrop": backdrop,
         "logo": logo,
@@ -456,16 +485,17 @@ def build_movie_payload(movie: dict, quality, encoded_string) -> dict:
     )
     runtime = movie.get("runtime")
     title = movie.get("name") or movie.get("slug") or ""
+    eng_name, eng_overview = _english_translation(movie)
     payload = {
         "tmdb_id": tmdb_id,
         "imdb_id": imdb_id,
         "title": title,
-        "title_english": title,
+        "title_english": eng_name or title,
         "original_title": movie.get("name") or "",
         "year": year,
         "year_end": year_end,
         "rate": rate,
-        "description": movie.get("overview") or "",
+        "description": eng_overview or movie.get("overview") or "",
         "poster": poster,
         "backdrop": backdrop,
         "logo": logo,
@@ -501,6 +531,15 @@ async def fetch_series_metadata(title, season, episode, encoded_string, year=Non
             "remoteIds": hit.get("remote_ids") or [],
         }
     ep = await episode_by_number(tvdb_id, season, episode)
+    if ep and ep.get("id"):
+        try:
+            ep_tr = await episode_translation(ep["id"])
+            if ep_tr:
+                ep = dict(ep)
+                ep["name"] = ep_tr.get("name") or ep.get("name")
+                ep["overview"] = ep_tr.get("overview") or ep.get("overview")
+        except Exception as e:
+            LOGGER.debug(f"[TVDB] episode translation fetch failed for {ep.get('id')}: {e}")
     return build_series_payload(series, ep, season, episode, quality, encoded_string)
 
 

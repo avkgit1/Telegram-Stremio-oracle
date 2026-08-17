@@ -233,9 +233,6 @@ async def series_extended(tvdb_id: int) -> Optional[dict]:
     cache_key = f"tvdb_series::{tvdb_id}"
 
     async def _produce():
-        # meta=translations is required or TVDB omits nameTranslations /
-        # overviewTranslations entirely, leaving name/overview in the
-        # record's original language.
         data = await _get(f"/series/{tvdb_id}/extended", {"meta": "translations"})
         return (data or {}).get("data")
 
@@ -309,10 +306,7 @@ async def _iter_series_episodes(tvdb_id: int, order: str = "default") -> list:
 
 
 async def episode_translation(episode_id: int, lang: str = "eng") -> Optional[dict]:
-    """Fetch the English (or given) translation for a single episode's
-    name/overview. Episode records from the /episodes/default listing don't
-    carry translations inline (unlike series/movies with meta=translations),
-    so this needs its own call — only done for the one episode being shown."""
+
     if not episode_id:
         return None
     cache_key = f"tvdb_ep_tr::{episode_id}::{lang}"
@@ -384,8 +378,6 @@ def _remote_ids(doc: dict) -> tuple:
 
 
 def _english_translation(doc: dict) -> tuple[Optional[str], Optional[str]]:
-    """Return (english_name, english_overview) from a TVDB extended record's
-    translations block, or (None, None) if not present / not fetched."""
     tr = doc.get("translations") or {}
     eng_name = None
     for item in tr.get("nameTranslations") or []:
@@ -436,13 +428,11 @@ def build_series_payload(
     ep_overview = (ep or {}).get("overview") or ""
     ep_aired = (ep or {}).get("aired") or (ep or {}).get("firstAired") or ""
     title = series.get("name") or series.get("slug") or ""
-    # Prefer English translation when available (requires meta=translations
-    # on the /extended fetch — see series_extended()).
     eng_name, eng_overview = _english_translation(series)
     payload = {
         "tmdb_id": tmdb_id,
         "imdb_id": imdb_id,
-        "title": title,
+        "title": eng_name or title,
         "title_english": eng_name or title,
         "original_title": series.get("name") or "",
         "year": year,
@@ -489,7 +479,7 @@ def build_movie_payload(movie: dict, quality, encoded_string) -> dict:
     payload = {
         "tmdb_id": tmdb_id,
         "imdb_id": imdb_id,
-        "title": title,
+        "title": eng_name or title,
         "title_english": eng_name or title,
         "original_title": movie.get("name") or "",
         "year": year,
